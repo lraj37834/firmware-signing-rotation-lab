@@ -1,23 +1,31 @@
 #!/bin/bash
+set -u
 
-if [ "$PWD" = "/" ]; then
-    echo "Error: No working directory set. Please set a WORKDIR in your Dockerfile before running this script."
-    exit 1
+LOG_DIR="/logs/verifier"
+if [ ! -d "/logs" ]; then
+    LOG_DIR="$(pwd)/logs/verifier"
+fi
+mkdir -p "$LOG_DIR"
+
+TEST_FILE="/tests/test_outputs.py"
+if [ ! -f "$TEST_FILE" ]; then
+    TEST_FILE="$(pwd)/tests/test_outputs.py"
 fi
 
-mkdir -p /logs/verifier
+PYTHON_CMD="python"
+if ! command -v python &> /dev/null; then
+    PYTHON_CMD="python3"
+fi
 
-# pytest + pytest-json-ctrf are pre-installed in the verifier image (shared mode).
-# allow_internet=false, so no wheels are resolved at run time — invoke pytest directly.
-python -m pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
+$PYTHON_CMD -m pytest --ctrf "$LOG_DIR/ctrf.json" "$TEST_FILE" -rA
 code=$?
 
-# Surface pytest's raw exit code so the negative-control check can tell "tests ran
-# and failed" (code 1, expected with no solution) from "tests could not run" (>=2).
 echo "pytest exit code: ${code}"
 
 if [ "$code" -eq 0 ]; then
-  echo 1 > /logs/verifier/reward.txt
+  echo 1 > "$LOG_DIR/reward.txt"
 else
-  echo 0 > /logs/verifier/reward.txt
+  echo 0 > "$LOG_DIR/reward.txt"
 fi
+
+exit $code

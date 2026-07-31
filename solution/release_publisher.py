@@ -1,4 +1,4 @@
-"""Firmware release publisher module.
+"""Firmware release publisher solution module.
 
 Loads build manifest CSV into DuckDB, reconciles withdrawals and duplicates via SQL,
 signs canonical descriptors using OpenSSL CMS, and submits signed bundles to Express gateway.
@@ -41,7 +41,6 @@ def resolve_file_path(relative_path: str) -> Path:
         if candidate.exists():
             return candidate
     return candidates[0]
-
 
 
 def fetch_current_key_metadata(gateway_url: str) -> dict[str, str]:
@@ -221,7 +220,6 @@ def sign_descriptor_cms(descriptor: str, cert_path: Path, key_path: Path) -> str
     finally:
         if os.path.exists(tmp_desc_path):
             os.remove(tmp_desc_path)
-
 
 
 def fetch_existing_receipt(

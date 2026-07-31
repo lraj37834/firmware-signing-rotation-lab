@@ -1,8 +1,19 @@
 #!/bin/bash
-# Placeholder solution entrypoint — candidate/scaffold stub.
-# Exits 0 so the harness proceeds to tests/test.sh; the smoke check only verifies
-# that the harness executes end-to-end, not that the reward is >= 1.0.
-#
-# The reference publisher (publisher/release-publisher.mjs) is authored and graded
-# separately by a human; no solution is included in this folder.
-exit 0
+set -e
+
+# Target publisher directory
+TARGET_DIR="/app/publisher"
+if [ ! -d "/app" ]; then
+    TARGET_DIR="$(pwd)/publisher"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+mkdir -p "$TARGET_DIR"
+
+cp "$SCRIPT_DIR/release-publisher.mjs" "$TARGET_DIR/release-publisher.mjs"
+cp "$SCRIPT_DIR/release_publisher.py" "$TARGET_DIR/release_publisher.py"
+
+chmod +x "$TARGET_DIR/release-publisher.mjs" 2>/dev/null || true
+
+echo "Solution successfully published to $TARGET_DIR"

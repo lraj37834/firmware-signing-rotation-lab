@@ -1,132 +1,286 @@
-"""Verifier tests for the RiftArena cartridge-decode repair task.
+"""Verifier test suite for firmware release publisher.
 
-Each test maps to a functional_criteria[] entry. The tests drive the headless
-scripted-playthrough harness (``riftarena.playthrough.run_playthrough``) — which
-needs no TTY and never launches the Textual UI — and compare the observed room
-graph, inventory transitions, and ending score against the canonical values
-documented in docs/arena_design_log.md.
-
-The four "repaired" tests call ``run_playthrough()`` with no arguments, so they
-read the live decode profile the player edits (config/cartridge_profile.toml).
-They pass only when that profile has been corrected; against the shipped
-(mis-configured) profile the cartridge disassembles wrongly and they fail.
-
-Run via tests/test.sh, which writes /logs/verifier/reward.txt.
+Evaluates data reconciliation, current-key signing verification, DuckDB receipt persistence,
+idempotent re-execution, and revoked-key signature rejection against Express gateway.
 """
 
 from __future__ import annotations
 
-import sys
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
-# The game lives under environment/riftarena; make its package importable
-# regardless of how pytest is invoked. Harbor runs from the workspace root.
-PROJECT_ROOT = Path.cwd() / "environment" / "riftarena"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from riftarena.playthrough import run_playthrough  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Canonical expected outcome — the ground truth from the design log. Pinned
-# here as verifier-owned constants so grading does not depend on any value the
-# player could edit inside environment/.
-# ---------------------------------------------------------------------------
-EXPECTED_ROOM_GRAPH = {
-    0: {"name": "Rift Threshold", "exits": {"north": 1, "east": 2}},
-    1: {"name": "Echo Vault", "exits": {"south": 0, "east": 3}},
-    2: {"name": "Sunken Gallery", "exits": {"north": 3, "west": 0}},
-    3: {"name": "Obsidian Span", "exits": {"south": 2, "east": 4, "west": 1}},
-    4: {"name": "Crown Sanctum", "exits": {"west": 3}},
-}
-
-EXPECTED_INVENTORY_TRANSITIONS = [
-    [],
-    ["Brass Key"],
-    ["Brass Key"],
-    ["Brass Key", "Echo Shard"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens", "Riftcrown"],
-]
-
-EXPECTED_ENDING_SCORE = 400
-
-# A decode profile that is correct in every dimension except the quest-state
-# record stride (4 instead of the canonical 6). Rooms and items still decode
-# cleanly (so nothing crashes), but the quest-opcode stream is read against the
-# wrong byte boundaries, yielding a wrong inventory/score. Used by the
-# sensitivity check below; independent of whatever the player writes to the live
-# profile.
-_WRONG_PROFILE_TOML = """\
-[cartridge]
-title = "RiftArena: Crown of the Rift"
-revision = 2
-
-[format]
-endian = "little"
-header_endian = "little"
-
-[opcode_widths]
-room_field = 2
-quest_opcode = 6
-
-[quest_state]
-table_offset_field = "quest_offset"
-record_stride = 4
-"""
+import duckdb
+import pytest
+import requests
 
 
-def test_playthrough_runs_to_completion():
-    """functional_criteria[id=playthrough_runs_to_completion]: with a correct
-    profile the scripted playthrough loads the cartridge, quest-state database
-    and local API and runs to the goal without crashing or stalling."""
-    outcome = run_playthrough()
-    assert outcome["finished"] is True, (
-        "scripted playthrough did not reach the goal (rooms unsolvable under the "
-        "current decode profile)"
+def resolve_path(rel_path: str) -> Path:
+    """Resolve relative workspace or absolute container path.
+
+    Args:
+        rel_path: Relative path string.
+
+    Returns:
+        Path: Resolved absolute path.
+    """
+    clean_path = rel_path.replace("\\", "/").strip("/")
+    if clean_path.startswith("app/"):
+        clean_path = clean_path[4:]
+
+    candidates = [
+        Path.cwd() / clean_path,
+        Path.cwd() / "environment" / clean_path,
+        Path("/app") / clean_path,
+        Path(__file__).resolve().parent.parent / clean_path,
+        Path(__file__).resolve().parent.parent / "environment" / clean_path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def is_gateway_alive(gateway_url: str) -> bool:
+    """Check if distribution gateway endpoint is active.
+
+    Args:
+        gateway_url: Base gateway URL.
+
+    Returns:
+        bool: True if endpoint responds OK, False otherwise.
+    """
+    try:
+        url = f"{gateway_url.rstrip('/')}/v1/signing-key/current"
+        resp = requests.get(url, timeout=2)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def start_gateway_process(gateway_dir: Path) -> subprocess.Popen[str]:
+    """Start distribution gateway Node server process in background.
+
+    Args:
+        gateway_dir: Directory containing server.js.
+
+    Returns:
+        subprocess.Popen[str]: Subprocess handle.
+    """
+    env = os.environ.copy()
+    cert_path = resolve_path("keys/current/current.cert.pem")
+    if cert_path.exists():
+        env["CURRENT_CERT_PATH"] = str(cert_path)
+
+    return subprocess.Popen(
+        ["node", "server.js"],
+        cwd=str(gateway_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
-def test_room_graph_matches_expected():
-    """functional_criteria[id=room_graph_matches_expected]: the visited rooms and
-    their exits match the documented topology. Fails while opcode widths /
-    endianness are wrong and the cartridge disassembles into wrong rooms."""
-    outcome = run_playthrough()
-    assert outcome["room_graph"] == EXPECTED_ROOM_GRAPH
+@pytest.fixture(scope="session", autouse=True)
+def gateway_service() -> Any:
+    """Session fixture ensuring Express distribution gateway is running."""
+    gateway_url = os.getenv("GATEWAY_URL", "http://127.0.0.1:7070")
+    if is_gateway_alive(gateway_url):
+        yield gateway_url
+        return
+
+    gateway_dir = resolve_path("distribution-gateway")
+    proc = start_gateway_process(gateway_dir)
+
+    for _ in range(30):
+        if is_gateway_alive(gateway_url):
+            break
+        time.sleep(0.2)
+
+    yield gateway_url
+
+    proc.terminate()
+    proc.wait(timeout=5)
 
 
-def test_inventory_transitions_match_expected():
-    """functional_criteria[id=inventory_transitions_match_expected]: the sequence
-    of inventory snapshots captured across the playthrough matches the documented
-    sequence. Fails while the quest-state table mapping is wrong."""
-    outcome = run_playthrough()
-    assert outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
+def run_report_command() -> str:
+    """Run `npm run report` and return stdout output.
 
+    Returns:
+        str: Captured stdout string.
+    """
+    publisher_mjs = resolve_path("publisher/release-publisher.mjs")
+    if not publisher_mjs.exists():
+        pytest.fail("Deliverable publisher/release-publisher.mjs is missing.")
 
-def test_ending_score_matches_expected():
-    """functional_criteria[id=ending_score_matches_expected]: the final score
-    equals the documented value. Fails while endian flags or the quest-state
-    table mapping are wrong."""
-    outcome = run_playthrough()
-    assert outcome["ending_score"] == EXPECTED_ENDING_SCORE
-
-
-def test_mis_config_fails_playthrough(tmp_path):
-    """functional_criteria[id=mis_config_fails_playthrough]: a profile with the
-    wrong decode parameters does NOT reproduce the canonical room graph /
-    inventory / score, so grading is sensitive to the repair rather than
-    tautologically satisfied."""
-    wrong_profile = tmp_path / "wrong_profile.toml"
-    wrong_profile.write_text(_WRONG_PROFILE_TOML, encoding="utf-8")
-
-    outcome = run_playthrough(config_path=str(wrong_profile))
-
-    matches_canonical = (
-        outcome["room_graph"] == EXPECTED_ROOM_GRAPH
-        and outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
-        and outcome["ending_score"] == EXPECTED_ENDING_SCORE
+    cmd = ["node", str(publisher_mjs), "--report"]
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, cwd=str(Path.cwd()), check=False
     )
-    assert not matches_canonical, (
-        "a deliberately mis-configured decode profile reproduced the canonical "
-        "outcome — the grader is not sensitive to the decode parameters"
+    if res.returncode != 0:
+        pytest.fail(f"npm run report failed code={res.returncode}\n{res.stderr}")
+    return res.stdout
+
+
+def mask_receipt_ids(text: str) -> str:
+    """Mask dynamic receipt IDs in CLI output string.
+
+    Args:
+        text: Raw CLI output text.
+
+    Returns:
+        str: Masked output text.
+    """
+    return re.sub(r"RECEIPT=[^\s]+", "RECEIPT=<id>", text.strip())
+
+
+def test_report_output_matches() -> None:
+    """Verify CLI status lines match golden expected output."""
+    output = run_report_command()
+    expected_path = resolve_path("reports/publications.expected.txt")
+    expected_text = expected_path.read_text(encoding="utf-8")
+
+    masked_actual = mask_receipt_ids(output)
+    masked_expected = mask_receipt_ids(expected_text)
+
+    assert masked_actual == masked_expected, (
+        f"CLI output mismatch:\nExpected:\n{masked_expected}\nActual:\n{masked_actual}"
+    )
+
+
+def test_withdrawals_and_duplicates_reconciled() -> None:
+    """Verify SQL reconciliation excludes withdrawn builds and duplicate rows."""
+    db_path = Path.cwd() / "releases.duckdb"
+    if not db_path.exists():
+        pytest.fail("releases.duckdb was not created.")
+
+    conn = duckdb.connect(str(db_path))
+    rows = conn.execute("SELECT bundle_id FROM publications ORDER BY bundle_id ASC").fetchall()
+    conn.close()
+
+    bundle_ids = [row[0] for row in rows]
+    assert bundle_ids == ["BND-101", "BND-102", "BND-103"], (
+        f"Expected reconciled publishable bundles ['BND-101', 'BND-102', 'BND-103'], got {bundle_ids}"
+    )
+
+
+def test_bundles_signed_with_current_key_accepted() -> None:
+    """Verify submitted descriptors are accepted by gateway with STATUS=PUBLISHED."""
+    db_path = Path.cwd() / "releases.duckdb"
+    conn = duckdb.connect(str(db_path))
+    rows = conn.execute("SELECT status FROM publications").fetchall()
+    conn.close()
+
+    statuses = [row[0] for row in rows]
+    assert len(statuses) == 3, f"Expected 3 published records, found {len(statuses)}"
+    assert all(s == "PUBLISHED" for s in statuses), (
+        f"All publication statuses must be PUBLISHED, got {statuses}"
+    )
+
+
+def test_receipts_and_tokens_persisted_in_duckdb() -> None:
+    """Verify table publications stores valid request tokens and publication IDs."""
+    db_path = Path.cwd() / "releases.duckdb"
+    conn = duckdb.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT bundle_id, request_token, publication_id, status FROM publications"
+    ).fetchall()
+    conn.close()
+
+    assert len(rows) == 3
+    for bundle_id, token, receipt_id, status in rows:
+        assert token == f"token-{bundle_id}"
+        assert receipt_id.startswith("pub")
+        assert status == "PUBLISHED"
+
+
+def test_idempotent_rerun_no_duplicate_publications() -> None:
+    """Verify re-executing report produces identical output without duplicating records."""
+    first_output = run_report_command()
+    second_output = run_report_command()
+
+    assert first_output == second_output, (
+        "Re-running publisher output was not identical to initial execution output."
+    )
+
+    ledger_path = resolve_path("distribution-gateway/data/gateway.json")
+    if ledger_path.exists():
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        pubs = data.get("publications", {})
+        assert len(pubs) == 3, f"Expected 3 ledger publications, found {len(pubs)}"
+
+
+def sign_descriptor_with_key(
+    descriptor: str, cert_path: Path, key_path: Path
+) -> str:
+    """Generate detached OpenSSL CMS signature for test validation.
+
+    Args:
+        descriptor: Canonical JSON descriptor string.
+        cert_path: Path to certificate file.
+        key_path: Path to private key file.
+
+    Returns:
+        str: Detached PEM signature string.
+    """
+    with tempfile.NamedTemporaryFile("wb", delete=False) as tmp:
+        tmp.write(descriptor.encode("utf-8"))
+        tmp_name = tmp.name
+
+    try:
+        git_openssl = Path("C:/Program Files/Git/usr/bin/openssl.exe")
+        exe = str(git_openssl) if git_openssl.is_file() else "openssl"
+        cmd = [
+            exe,
+            "cms",
+            "-sign",
+            "-in",
+            tmp_name,
+            "-signer",
+            str(cert_path),
+            "-inkey",
+            str(key_path),
+            "-outform",
+            "PEM",
+            "-binary",
+        ]
+        res = subprocess.run(cmd, capture_output=True, check=True, text=True)
+        return res.stdout
+    finally:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
+
+
+def test_revoked_key_signature_rejected(gateway_service: str) -> None:
+    """Verify descriptors signed with revoked key are rejected with UNTRUSTED_SIGNATURE."""
+    revoked_cert = resolve_path("keys/revoked/revoked.cert.pem")
+    revoked_key = resolve_path("keys/revoked/revoked.key.pem")
+
+    descriptor = json.dumps(
+        {"artifact_count": 1, "bundle_id": "BND-TEST-REVOKED", "total_bytes": 1000},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    sig = sign_descriptor_with_key(descriptor, revoked_cert, revoked_key)
+
+    endpoint = f"{gateway_service.rstrip('/')}/v1/publications"
+    payload = {
+        "descriptor": descriptor,
+        "signature": sig,
+        "request_token": "token-BND-TEST-REVOKED",
+    }
+    resp = requests.post(endpoint, json=payload, timeout=10)
+
+    assert resp.status_code == 400, (
+        f"Expected HTTP 400 rejection for revoked key, got status {resp.status_code}"
+    )
+    data = resp.json()
+    assert data.get("error") == "UNTRUSTED_SIGNATURE", (
+        f"Expected UNTRUSTED_SIGNATURE error, got {data}"
     )
