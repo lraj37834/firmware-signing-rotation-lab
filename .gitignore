@@ -250,3 +250,10 @@ distribution-gateway/data/*.db
 .DS_Store
 Thumbs.db
 
+# Cryptographic Keys & SSL Certificates (Generated dynamically at build/runtime)
+keys/
+*.pem
+*.key
+*.cert
+
+
