@@ -216,3 +216,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node.js dependencies and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+.npm
+.node_repl_history
+*.tgz
+
+# DuckDB database files and write-ahead logs
+releases.duckdb
+*.duckdb
+*.duckdb.wal
+
+# Generated report outputs
+reports/publications.actual.txt
+/publications.actual.txt
+
+# Distribution gateway runtime ledger
+distribution-gateway/data/*.json
+distribution-gateway/data/*.db
+!distribution-gateway/data/.gitkeep
+
+# IDEs and OS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
