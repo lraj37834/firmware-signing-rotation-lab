@@ -1,4 +1,2 @@
 node_modules/
-data/gateway.json
-data/*.db
-data/*.sqlite3
+data/

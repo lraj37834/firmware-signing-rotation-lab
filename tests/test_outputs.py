@@ -77,6 +77,15 @@ def start_gateway_process(gateway_dir: Path) -> subprocess.Popen[str]:
     if cert_path.exists():
         env["CURRENT_CERT_PATH"] = str(cert_path)
 
+    node_modules = gateway_dir / "node_modules"
+    if not node_modules.exists():
+        subprocess.run(
+            ["npm", "install", "--no-audit", "--no-fund"],
+            cwd=str(gateway_dir),
+            check=True,
+            capture_output=True,
+        )
+
     return subprocess.Popen(
         ["node", "server.js"],
         cwd=str(gateway_dir),
@@ -98,10 +107,23 @@ def gateway_service() -> Any:
     gateway_dir = resolve_path("distribution-gateway")
     proc = start_gateway_process(gateway_dir)
 
+    started = False
     for _ in range(30):
+        if proc.poll() is not None:
+            stderr_out = proc.stderr.read() if proc.stderr else ""
+            pytest.fail(
+                f"Gateway process exited prematurely (code={proc.returncode}).\n"
+                f"stderr: {stderr_out}"
+            )
         if is_gateway_alive(gateway_url):
+            started = True
             break
         time.sleep(0.2)
+
+    if not started and proc.poll() is None:
+        # Process is still running but not responding — yield anyway and let
+        # individual tests fail with ConnectionRefusedError.
+        pass
 
     yield gateway_url
 

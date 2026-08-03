@@ -238,9 +238,11 @@ reports/publications.actual.txt
 /publications.actual.txt
 
 # Distribution gateway runtime ledger
-distribution-gateway/data/*.json
-distribution-gateway/data/*.db
-!distribution-gateway/data/.gitkeep
+distribution-gateway/data/
+
+# Publisher runtime artifacts (populated by solution/publish.sh at run time)
+# Only the committed deliverable in solution/ is source-of-truth.
+publisher/release_publisher.py
 
 # IDEs and OS metadata
 .idea/
