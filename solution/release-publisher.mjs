@@ -125,16 +125,7 @@ con.all(query, async (err, bundles) => {
         const receiptId = publishData.publication_id;
         const status = publishData.status || 'PUBLISHED';
 
-        await new Promise((resolve, reject) => {
-          con.run(
-            `INSERT OR REPLACE INTO publications (bundle_id, publication_id, request_token, key_id, status) VALUES (?, ?, ?, ?, ?)`,
-            [bundleId, receiptId, token, keyId, status],
-            (err) => {
-              if (err) reject(err);
-              else resolve();
-            }
-          );
-        });
+        con.run(`INSERT OR REPLACE INTO publications (bundle_id, publication_id, request_token, key_id, status) VALUES ('${bundleId}', '${receiptId}', '${token}', '${keyId}', '${status}')`);
 
         console.log(`BUNDLE ${bundleId} PUBLISHED RECEIPT=${receiptId} TOKEN=${token} STATUS=${status}`);
       } finally {
