@@ -1,6 +1,6 @@
 # Firmware Signing Rotation Lab
 
-A background **Firmware Release Publisher** application built in **Python** with **DuckDB** and **OpenSSL CMS**, designed to reconcile firmware build manifests, sign release bundles with active cryptographic certificates, integrate with an Express distribution gateway over HTTP, and maintain idempotent publication receipts locally.
+A background **Firmware Release Publisher** application built in **Node.js** with **DuckDB** and **OpenSSL CMS**, designed to reconcile firmware build manifests, sign release bundles with active cryptographic certificates, integrate with an Express distribution gateway over HTTP, and maintain idempotent publication receipts locally.
 
 ---
 
@@ -20,7 +20,7 @@ A background **Firmware Release Publisher** application built in **Python** with
              │                                 │ (Surviving Bundles)
              │ HTTP POST                       ▼
 ┌────────────┴───────────────────────────────────────────────┐
-│ Python Publisher (publisher/release_publisher.py)          │
+│ Node.js Publisher (publisher/release-publisher.mjs)        │
 │ 1. Fetch current key info (/v1/signing-key/current)        │
 │ 2. Build canonical descriptor JSON                         │
 │ 3. Sign via OpenSSL CMS (keys/current/current.key.pem)    │
@@ -54,8 +54,7 @@ A background **Firmware Release Publisher** application built in **Python** with
 ## 🚀 Getting Started & Execution
 
 ### Prerequisites
-- Python 3.10+ (with `duckdb` and `requests` packages)
-- Node.js 18+ (for running the Express distribution gateway)
+- Node.js 18+ (with `duckdb` package)
 - OpenSSL CLI (`openssl`)
 
 ### Running the Application
@@ -65,12 +64,12 @@ A background **Firmware Release Publisher** application built in **Python** with
    node environment/distribution-gateway/server.js
    ```
 
-2. **Run the Publisher (Python Direct)**:
+2. **Publish Solution**:
    ```bash
-   python publisher/release_publisher.py
+   bash solution/publish.sh
    ```
 
-3. **Run via NPM Script (Node Bridge)**:
+3. **Run via NPM Script**:
    ```bash
    npm run report
    ```
@@ -79,8 +78,8 @@ A background **Firmware Release Publisher** application built in **Python** with
 
 ## 📁 Repository Layout
 
-- `publisher/release_publisher.py`: Core Python application logic and SQL queries.
-- `publisher/release-publisher.mjs`: Node ESM bridge entry point for `npm run report`.
+- `solution/release-publisher.mjs`: Pure Node.js application solution.
+- `publisher/release-publisher.mjs`: Delivered Node ESM entry point.
 - `environment/distribution-gateway/`: Express distribution service and key metadata endpoints.
-- `environment/fixtures/build_manifest.csv`: Input build manifest dataset.
-- `environment/reports/publications.expected.txt`: Golden expected output reference file.
+- `fixtures/build_manifest.csv`: Input build manifest dataset.
+- `reports/publications.expected.txt`: Golden expected output reference file.
