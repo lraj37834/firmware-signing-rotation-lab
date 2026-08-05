@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import duckdb from 'duckdb';
@@ -32,111 +33,141 @@ const gatewayUrl = process.env.GATEWAY_URL || process.env.GATEWAY_BASE_URL || 'h
 const db = new duckdb.Database(dbPath);
 const con = db.connect();
 
-con.run(`
-  CREATE TABLE IF NOT EXISTS publications (
-    bundle_id VARCHAR PRIMARY KEY,
-    publication_id VARCHAR,
-    request_token VARCHAR,
-    key_id VARCHAR,
-    status VARCHAR
-  )
-`);
+async function main() {
+  await new Promise((resolve, reject) => {
+    con.run(
+      `CREATE TABLE IF NOT EXISTS publications (
+        bundle_id VARCHAR PRIMARY KEY,
+        publication_id VARCHAR,
+        request_token VARCHAR,
+        key_id VARCHAR,
+        status VARCHAR
+      )`,
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
 
-const query = `
-  WITH raw AS (
-    SELECT DISTINCT * FROM read_csv_auto('${manifestPath}')
-  ),
-  withdrawn AS (
-    SELECT supersedes_id FROM raw WHERE record_type = 'WITHDRAWAL' AND supersedes_id IS NOT NULL AND supersedes_id != ''
-  ),
-  valid AS (
-    SELECT * FROM raw 
-    WHERE record_type = 'BUILD' 
-    AND entry_id NOT IN (SELECT supersedes_id FROM withdrawn)
-  )
-  SELECT 
-    bundle_id, 
-    CAST(COUNT(entry_id) AS INTEGER) as artifact_count, 
-    CAST(SUM(size_bytes) AS BIGINT) as total_bytes
-  FROM valid
-  GROUP BY bundle_id
-  HAVING COUNT(entry_id) > 0
-  ORDER BY bundle_id ASC;
-`;
+  const query = `
+    WITH raw AS (
+      SELECT DISTINCT * FROM read_csv_auto('${manifestPath}')
+    ),
+    withdrawn AS (
+      SELECT supersedes_id FROM raw WHERE record_type = 'WITHDRAWAL' AND supersedes_id IS NOT NULL AND supersedes_id != ''
+    ),
+    valid AS (
+      SELECT * FROM raw 
+      WHERE record_type = 'BUILD' 
+      AND entry_id NOT IN (SELECT supersedes_id FROM withdrawn)
+    )
+    SELECT 
+      bundle_id, 
+      CAST(COUNT(entry_id) AS INTEGER) as artifact_count, 
+      CAST(SUM(size_bytes) AS BIGINT) as total_bytes
+    FROM valid
+    GROUP BY bundle_id
+    HAVING COUNT(entry_id) > 0
+    ORDER BY bundle_id ASC;
+  `;
 
-con.all(query, async (err, bundles) => {
-  if (err) {
-    console.error("Failed to query manifest:", err);
-    process.exit(1);
+  const bundles = await new Promise((resolve, reject) => {
+    con.all(query, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+
+  const keyRes = await fetch(`${gatewayUrl.replace(/\/+$/, '')}/v1/signing-key/current`);
+  if (!keyRes.ok) {
+    throw new Error(`Gateway returned HTTP ${keyRes.status}: ${keyRes.statusText}`);
   }
+  const keyInfo = await keyRes.json();
+  const keyId = keyInfo.key_id;
 
-  try {
-    const keyRes = await fetch(`${gatewayUrl.replace(/\/+$/, '')}/v1/signing-key/current`);
-    if (!keyRes.ok) {
-      throw new Error(`Failed to fetch signing key metadata: ${keyRes.statusText}`);
+  for (const bundle of bundles) {
+    const bundleId = bundle.bundle_id;
+    const token = `token-${bundleId}`;
+
+    const existing = await new Promise((resolve, reject) => {
+      con.all(
+        `SELECT publication_id, request_token, status FROM publications WHERE bundle_id = ?`,
+        bundleId,
+        (err, res) => (err ? reject(err) : resolve(res && res.length > 0 ? res[0] : null))
+      );
+    });
+
+    console.log(`BUNDLE ${bundleId} SIGNED KEY=${keyId}`);
+
+    if (existing) {
+      console.log(`BUNDLE ${bundleId} PUBLISHED RECEIPT=${existing.publication_id} TOKEN=${existing.request_token} STATUS=${existing.status}`);
+      continue;
     }
-    const keyInfo = await keyRes.json();
-    const keyId = keyInfo.key_id;
 
-    for (const bundle of bundles) {
-      const bundleId = bundle.bundle_id;
-      const token = `token-${bundleId}`;
+    const descriptor = JSON.stringify({
+      artifact_count: Number(bundle.artifact_count),
+      bundle_id: bundleId,
+      total_bytes: Number(bundle.total_bytes)
+    });
 
-      const existing = await new Promise((resolve, reject) => {
-        con.all(`SELECT publication_id, request_token, status FROM publications WHERE bundle_id = '${bundleId}'`, (err, res) => {
-          if (err) reject(err);
-          else resolve(res && res.length > 0 ? res[0] : null);
-        });
-      });
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'publisher-'));
+    const tmpDesc = path.join(tmpDir, 'descriptor.bin');
 
-      console.log(`BUNDLE ${bundleId} SIGNED KEY=${keyId}`);
-
-      if (existing) {
-        console.log(`BUNDLE ${bundleId} PUBLISHED RECEIPT=${existing.publication_id} TOKEN=${existing.request_token} STATUS=${existing.status}`);
-        continue;
-      }
-
-      const descriptor = JSON.stringify({
-        artifact_count: Number(bundle.artifact_count),
-        bundle_id: bundleId,
-        total_bytes: Number(bundle.total_bytes)
-      });
-
-      const tmpDesc = path.join(process.cwd(), `.desc_${bundleId}.bin`);
-      const tmpSig = path.join(process.cwd(), `.sig_${bundleId}.pem`);
-
+    try {
       fs.writeFileSync(tmpDesc, descriptor, 'utf8');
 
-      try {
-        const opensslCmd = `${getOpenSSLBin()} cms -sign -in "${tmpDesc}" -signer "${certPath}" -inkey "${keyPath}" -outform PEM -binary`;
-        const signature = execSync(opensslCmd, { encoding: 'utf8' });
+      const opensslCmd = `${getOpenSSLBin()} cms -sign -in "${tmpDesc}" -signer "${certPath}" -inkey "${keyPath}" -outform PEM -binary`;
+      const signature = execSync(opensslCmd, { encoding: 'utf8' });
 
-        const publishRes = await fetch(`${gatewayUrl.replace(/\/+$/, '')}/v1/publications`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            descriptor,
-            signature,
-            request_token: token
-          })
-        });
+      const publishRes = await fetch(`${gatewayUrl.replace(/\/+$/, '')}/v1/publications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          descriptor,
+          signature,
+          request_token: token
+        })
+      });
 
-        const publishData = await publishRes.json();
-        const receiptId = publishData.publication_id;
-        const status = publishData.status || 'PUBLISHED';
+      const publishData = await publishRes.json();
 
-        con.run(`INSERT OR REPLACE INTO publications (bundle_id, publication_id, request_token, key_id, status) VALUES ('${bundleId}', '${receiptId}', '${token}', '${keyId}', '${status}')`);
+      if (!publishRes.ok || publishData.error) {
+        const errorMsg = publishData.error || `HTTP ${publishRes.status}: ${publishRes.statusText}`;
+        throw new Error(`Gateway rejected bundle ${bundleId}: ${errorMsg}`);
+      }
 
-        console.log(`BUNDLE ${bundleId} PUBLISHED RECEIPT=${receiptId} TOKEN=${token} STATUS=${status}`);
-      } finally {
-        if (fs.existsSync(tmpDesc)) fs.unlinkSync(tmpDesc);
-        if (fs.existsSync(tmpSig)) fs.unlinkSync(tmpSig);
+      const receiptId = publishData.publication_id;
+      const status = publishData.status || 'PUBLISHED';
+
+      await new Promise((resolve, reject) => {
+        con.run(
+          `INSERT OR REPLACE INTO publications (bundle_id, publication_id, request_token, key_id, status) VALUES (?, ?, ?, ?, ?)`,
+          bundleId,
+          receiptId,
+          token,
+          keyId,
+          status,
+          (err) => (err ? reject(err) : resolve())
+        );
+      });
+
+      console.log(`BUNDLE ${bundleId} PUBLISHED RECEIPT=${receiptId} TOKEN=${token} STATUS=${status}`);
+    } finally {
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }
-  } catch (e) {
-    console.error("Error during publishing:", e);
-    process.exit(1);
-  } finally {
-    con.close();
   }
-});
+}
+
+main()
+  .then(() => {
+    con.close(() => {
+      db.close(() => {
+        process.exit(0);
+      });
+    });
+  })
+  .catch((err) => {
+    console.error("Error during publishing:", err.message || err);
+    con.close(() => {
+      db.close(() => {
+        process.exit(1);
+      });
+    });
+  });
